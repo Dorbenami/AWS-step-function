@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudFormation template to create a Step Functions workflow for snapshot handling and patching, triggered by EventBridge.
+
+Parameters:
+  StateMachineName:
+    Type: String
+    Default: SnapshotAndPatchingStateMachine
+    Description: The name of the Step Functions state machine.
+
+Resources:
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeVolumes
+                  - ec2:CreateSnapshot
+                  - ec2:DescribeSnapshots
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # Lambda Function for Snapshots
+  SnapshotLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 15
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              ec2 = boto3.client('ec2')
+              logger.info("Starting snapshot creation process")
+              instances = ec2.describe_instances(
+                  Filters=[{'Name': 'tag:Patch Group', 'Values': ['windows-production']}]
+              )['Reservations']
+              volumes = []
+              for reservation in instances:
+                  for instance in reservation['Instances']:
+                      for mapping in instance['BlockDeviceMappings']:
+                          volumes.append(mapping['Ebs']['VolumeId'])
+
+              if not volumes:
+                  logger.warning("No volumes found for the instances.")
+                  return {"status": "No volumes found"}
+
+              for volume_id in volumes:
+                  ec2.create_snapshot(VolumeId=volume_id, Description=f"Snapshot for volume {volume_id}")
+                  logger.info(f"Snapshot created for volume: {volume_id}")
+              return {"status": "Snapshots created successfully"}
+
+  # IAM Role for Step Functions State Machine
+  StateMachineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StateMachinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - ssm:SendCommand
+                Resource: "*"
+
+  # Step Functions State Machine
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Ref StateMachineName
+      RoleArn: !GetAtt StateMachineExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "State machine to handle snapshots and patching",
+          "StartAt": "SnapshotCreation",
+          "States": {
+            "SnapshotCreation": {
+              "Type": "Task",
+              "Resource": "${SnapshotLambdaFunction.Arn}",
+              "Next": "Patching",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "Failure"
+                }
+              ]
+            },
+            "Patching": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+              "Parameters": {
+                "DocumentName": "AWS-RunPatchBaseline",
+                "Targets": [
+                  {
+                    "Key": "tag:Patch Group",
+                    "Values": ["windows-production"]
+                  }
+                ],
+                "Parameters": {
+                  "Operation": ["Install"]
+                }
+              },
+              "End": true,
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "Failure"
+                }
+              ]
+            },
+            "Failure": {
+              "Type": "Fail",
+              "Error": "WorkflowFailed",
+              "Cause": "Snapshot creation or patching failed."
+            }
+          }
+        }
+
+  # IAM Role for EventBridge
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EventBridgeStepFunctionsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref StateMachine
+
+  # EventBridge Rule to Trigger Step Functions
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: "cron(59 23 ? * 3#2 *)
+" # Adjust the schedule as needed
+      State: ENABLED
+      Targets:
+        - Arn: !Ref StateMachine
+          Id: SnapshotAndPatchingTarget
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the Lambda Function
+    Value: !GetAtt SnapshotLambdaFunction.Arn
+  StateMachineArn:
+    Description: ARN of the Step Functions State Machine
+    Value: !Ref StateMachine
