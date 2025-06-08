@@ -2,6 +2,9 @@
 
 This repository contains a CloudFormation template for deploying an automated workflow that handles EC2 snapshot creation and patching using AWS Step Functions. The workflow ensures data integrity by introducing a dependency: patching will only proceed if snapshot creation succeeds.
 
+![image](https://github.com/user-attachments/assets/832db1b0-d232-447a-badb-b9a31402ebcf)
+
+
 ## Features
 
 - **Automated Workflow**: Orchestrates snapshot creation and patching using AWS Step Functions.
